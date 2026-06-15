@@ -87,6 +87,11 @@ def clean_job() -> pd.DataFrame:
     panel["avg_salary_month"] = (panel["avg_wage_year"] / 12).round(0)
     panel["gdp_yi"] = (panel["gdp_wan"] / 10000).round(2)  # 万元→亿元
 
+    # 就业人数部分年份缺失（如成都 2019 年起断档），用城市内时间序列
+    # 前向+后向填充，让其继承最近的真实值，优于跨城市中位数填充。
+    panel = panel.sort_values(["city", "year"])
+    panel["urban_employment_wan"] = panel.groupby("city")["urban_employment_wan"].ffill().bfill()
+
     keep = [
         "year", "city", "avg_wage_year", "avg_salary_month",
         "gdp_yi", "gdp_per_capita", "population_wan",
