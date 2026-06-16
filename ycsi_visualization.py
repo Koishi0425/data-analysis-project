@@ -12,8 +12,16 @@ os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.patches import Rectangle
 from matplotlib.ticker import PercentFormatter
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+from scipy import stats
+from scipy.cluster.hierarchy import leaves_list, linkage
+from scipy.spatial.distance import squareform
 from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_score
+from sklearn.preprocessing import StandardScaler
 
 
 warnings.filterwarnings("ignore")
@@ -34,7 +42,6 @@ CLEAN_DIR = DATA_DIR / "clean"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# 真实数据基准年（与 clean_data.py 的 BASE_YEAR 一致）。
 BASE_YEAR = 2021
 
 CITY_COORDS = {
@@ -73,79 +80,130 @@ COORDS_BY_ORDER = [
     (120.3826, 36.0671),
 ]
 
-POI_COLS = ["subway", "hospital", "park", "mall", "restaurant", "library", "gym"]
-YCSI_FEATURES = [
-    "opportunity_score",
-    "rent_pressure",
-    "life_score",
-    "growth_score",
-    "commute_score",
-]
-WEIGHTS = {
-    "opportunity": 0.30,
-    "life": 0.20,
-    "growth": 0.20,
-    "rent": 0.20,
-    "commute": 0.10,
-}
+YANGTZE_DELTA_CITIES = ["上海", "苏州", "杭州", "南京"]
 
-# YCSI 展示分区间：避免首尾城市被钉死为 0/100，体现"相对指数"含义。
-SCORE_FLOOR = 40.0
-SCORE_CEIL = 95.0
+POI_COLS = ["subway", "hospital", "park", "mall", "restaurant", "library", "gym"]
+POI_DISPLAY = {
+    "subway": "地铁",
+    "hospital": "医院",
+    "park": "公园",
+    "mall": "商场",
+    "restaurant": "餐饮",
+    "library": "图书馆",
+    "gym": "健身房",
+}
+POI_WEIGHTS = pd.Series(
+    {
+        "subway_per_10k": 0.18,
+        "hospital_per_10k": 0.16,
+        "park_per_10k": 0.14,
+        "mall_per_10k": 0.14,
+        "restaurant_per_10k": 0.16,
+        "library_per_10k": 0.10,
+        "gym_per_10k": 0.12,
+    }
+)
+
+DIMENSION_COLS = {
+    "机会": "opportunity_score",
+    "居住友好": "housing_friendliness",
+    "通勤友好": "commute_friendliness",
+    "生活便利": "life_score",
+    "成长潜力": "growth_score",
+}
+DIMENSION_WEIGHTS = {
+    "opportunity_score": 0.30,
+    "housing_friendliness": 0.20,
+    "commute_friendliness": 0.10,
+    "life_score": 0.20,
+    "growth_score": 0.20,
+}
+DIMENSION_PALETTE = {
+    "opportunity_score": "#2f6fb0",
+    "housing_friendliness": "#3b8f5a",
+    "commute_friendliness": "#2aa6a1",
+    "life_score": "#16a085",
+    "growth_score": "#c99a2e",
+}
+COLORS = {
+    "ycsi": "#3f4a8a",
+    "ycsi_dark": "#26346d",
+    "opportunity": "#2f6fb0",
+    "housing": "#3b8f5a",
+    "commute": "#2aa6a1",
+    "life": "#16a085",
+    "growth": "#c99a2e",
+    "pressure": "#d95f02",
+    "muted": "#c9cdd2",
+    "grid": "#d8dde3",
+    "text": "#253040",
+}
 
 CHART_PLAN = [
     {
-        "chart": "全国城市生存力指数点状热力图",
-        "question": "15 个目标城市的综合友好度与空间分布",
-        "fields": "city, lng, lat, YCSI, population",
-        "output": "02_ycsi_city_heat_points.png",
-    },
-    {
-        "chart": "YCSI 排名柱状图",
-        "question": "哪些城市更适合作为毕业后的第一座城市",
-        "fields": "YCSI, opportunity, life, growth, rent pressure, commute pressure",
+        "chart": "YCSI 综合排名与五维贡献图",
+        "question": "哪些城市综合表现更强，各维度如何贡献最终得分",
+        "fields": "YCSI, opportunity, housing friendliness, commute friendliness, life, growth",
         "output": "01_ycsi_ranking.png",
     },
     {
-        "chart": "工资 vs 租金收入比气泡图",
-        "question": "就业机会与租房压力是否匹配",
+        "chart": "15城青年城市生存力空间分布",
+        "question": "15 个目标城市的综合表现与空间分布",
+        "fields": "city, lng, lat, YCSI, population_wan",
+        "output": "02_ycsi_city_heat_points.png",
+    },
+    {
+        "chart": "城市平均月薪与住房负担关系",
+        "question": "高薪是否足以抵消高房租",
         "fields": "avg_salary, avg_rent, rent_income_ratio, job_count",
         "output": "03_salary_rent_bubble.png",
     },
     {
-        "chart": "机会-居住压力四象限图",
-        "question": "城市属于高机会高压力、低压稳健等哪类",
-        "fields": "opportunity_score, rent_pressure, YCSI",
+        "chart": "机会指数与居住友好度四象限",
+        "question": "哪些城市在就业机会和住房负担之间更均衡",
+        "fields": "opportunity_score, housing_friendliness, YCSI",
         "output": "04_opportunity_pressure_quadrant.png",
     },
     {
-        "chart": "城市指标雷达图",
-        "question": "典型城市在机会、居住、通勤、生活、成长上的差异",
-        "fields": "five YCSI dimensions",
+        "chart": "聚类代表城市五维雷达图",
+        "question": "不同城市类型的典型画像差异",
+        "fields": "five YCSI dimensions, cluster representative cities",
         "output": "05_city_radar.png",
     },
     {
-        "chart": "生活便利 POI 构成图",
-        "question": "城市日常生活便利度差异",
+        "chart": "生活便利综合得分点图",
+        "question": "哪些城市的人均生活便利资源更充分",
+        "fields": "life_score, poi_per_10k",
+        "output": "06a_life_score_dot.png",
+    },
+    {
+        "chart": "各类 POI 构成 100% 堆积图",
+        "question": "不同城市生活设施结构是否均衡",
         "fields": "subway, hospital, park, mall, restaurant, library, gym",
-        "output": "06_poi_convenience_stack.png",
+        "output": "06b_poi_composition_100pct.png",
     },
     {
-        "chart": "指标相关性热力图",
-        "question": "薪资、租金、生活便利、就业机会之间的关系",
-        "fields": "salary, rent, job count, YCSI dimensions",
-        "output": "07_metric_correlation_heatmap.png",
+        "chart": "原始变量相关性热力图",
+        "question": "薪资、租金、岗位、人均资源等原始变量之间的关系",
+        "fields": "raw variables only",
+        "output": "07a_raw_variable_correlation_heatmap.png",
     },
     {
-        "chart": "K-Means 城市聚类图",
+        "chart": "五个一级指标相关性热力图",
+        "question": "五个一级指标之间是否存在结构性相关",
+        "fields": "five YCSI dimensions only",
+        "output": "07b_dimension_correlation_heatmap.png",
+    },
+    {
+        "chart": "五维 K-Means 城市聚类 PCA 图",
         "question": "推荐不同类型青年适合的城市类别",
-        "fields": "five YCSI dimensions",
+        "fields": "five YCSI dimensions, PCA components",
         "output": "08_city_clusters.png",
     },
     {
-        "chart": "商品房租金月度趋势图",
-        "question": "各城市租金随时间的变化（2018-2025）",
-        "fields": "date, city, rent_per_sqm",
+        "chart": "商品房租金绝对水平与指数趋势",
+        "question": "各城市租金水平和相对涨跌趋势如何变化",
+        "fields": "date, city, rent_per_sqm, rent index 2018=100",
         "output": "09_rent_trend.png",
     },
 ]
@@ -173,12 +231,30 @@ def minmax(series: pd.Series) -> pd.Series:
     return (values - values.min()) / span
 
 
+def scale_bubble(series: pd.Series, min_size: float = 90, max_size: float = 850) -> pd.Series:
+    return min_size + minmax(series) * (max_size - min_size)
+
+
+def safe_per_10k(numerator: pd.Series, population_wan: pd.Series) -> pd.Series:
+    denominator = pd.to_numeric(population_wan, errors="coerce").replace(0, np.nan)
+    values = pd.to_numeric(numerator, errors="coerce") / denominator
+    return values.replace([np.inf, -np.inf], np.nan).fillna(values.median())
+
+
 def save_figure(filename: str) -> Path:
     path = OUTPUT_DIR / filename
-    plt.tight_layout()
-    plt.savefig(path, dpi=180, bbox_inches="tight")
+    fig = plt.gcf()
+    fig.tight_layout(rect=(0, 0.045, 1, 1))
+    fig.savefig(path, dpi=180, bbox_inches="tight")
     plt.close()
     return path
+
+
+def copy_compat_output(source_filename: str, target_filename: str) -> Path:
+    source = OUTPUT_DIR / source_filename
+    target = OUTPUT_DIR / target_filename
+    target.write_bytes(source.read_bytes())
+    return target
 
 
 def write_chart_plan() -> Path:
@@ -195,7 +271,7 @@ def write_chart_plan() -> Path:
     lines.extend(
         [
             "",
-            "可选扩展：通勤-租房地图需要 `rent_data.csv` 中的区县/房源级租金、经纬度和就业中心数据；文本词云需要 `city_text.csv` 的 `city,text` 评论数据。",
+            "说明：本轮为静态图优先版本，不引入外部地图底图和交互式选择器；指标方向统一为越高越好。",
             "",
         ]
     )
@@ -257,167 +333,280 @@ def load_base_data() -> pd.DataFrame:
 
 
 def add_job_and_rent_metrics(metrics: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    """接入真实薪资/租金/就业数据（data/clean/city_snapshot.csv）。
-
-    数据来源：
-      - 薪资 avg_salary：城镇非私营单位在岗职工平均工资 / 12（2021，元/月）
-      - 租金 avg_rent：商品房平均出租价格 × 50㎡（2021，元/月）
-      - 岗位规模 job_count：城镇非私营单位从业人员数（万人，真实就业规模代理）
-    若快照缺失则回退到宏观指标估算（保留兼容）。
-    """
+    """接入真实薪资、租金、人口和就业数据。"""
     metrics = metrics.copy()
     source_notes: list[str] = []
 
     snap_path = CLEAN_DIR / "city_snapshot.csv"
-    if snap_path.exists():
-        snap = read_csv_fallback(snap_path)
-        snap.columns = [str(c).strip() for c in snap.columns]
-        cols = {
-            "city": "city",
-            "avg_salary_month": "avg_salary",
-            "rent_month_est": "avg_rent",
-            "rent_income_ratio": "rent_income_ratio",
-            "urban_employment_wan": "urban_employment_wan",
-        }
-        snap = snap[list(cols.keys())].rename(columns=cols)
-        for col in ("avg_salary", "avg_rent", "rent_income_ratio", "urban_employment_wan"):
-            snap[col] = pd.to_numeric(snap[col], errors="coerce")
-        # 就业人数（万人）作为真实"岗位规模"代理，替代原模拟 job_count
-        snap["job_count"] = (snap["urban_employment_wan"] * 10000).round(0).astype("Int64")
-        snap = snap.drop(columns=["urban_employment_wan"])
-
-        metrics = metrics.merge(snap, on="city", how="left")
-        source_notes.append(
-            f"薪资数据：城镇非私营单位在岗职工平均工资/12（{BASE_YEAR}，真实，data/job_data.csv）。"
-        )
-        source_notes.append(
-            f"租金数据：商品房平均出租价格×50㎡（{BASE_YEAR}，真实，data/rent_data.xlsx）。"
-        )
-        source_notes.append(
-            "岗位规模：以城镇非私营单位从业人员数代理（真实就业规模）。"
-        )
-    else:
-        source_notes.append("未发现 city_snapshot.csv，请先运行 clean_data.py 生成清洗数据。")
+    if not snap_path.exists():
         raise FileNotFoundError(f"缺少清洗数据: {snap_path}，请先运行 python clean_data.py")
 
-    # 兜底：极个别缺失用中位数填充，保证后续计算不崩
-    for col in ("avg_salary", "avg_rent", "rent_income_ratio"):
+    snap = read_csv_fallback(snap_path)
+    snap.columns = [str(c).strip() for c in snap.columns]
+    cols = {
+        "city": "city",
+        "avg_salary_month": "avg_salary",
+        "rent_month_est": "avg_rent",
+        "rent_income_ratio": "rent_income_ratio",
+        "urban_employment_wan": "urban_employment_wan",
+        "population_wan": "population_wan",
+        "gdp_per_capita": "gdp_per_capita",
+        "gdp_yi": "gdp_snapshot_yi",
+    }
+    snap = snap[list(cols.keys())].rename(columns=cols)
+    for col in [
+        "avg_salary",
+        "avg_rent",
+        "rent_income_ratio",
+        "urban_employment_wan",
+        "population_wan",
+        "gdp_per_capita",
+        "gdp_snapshot_yi",
+    ]:
+        snap[col] = pd.to_numeric(snap[col], errors="coerce")
+
+    snap["job_count"] = (snap["urban_employment_wan"] * 10000).round(0)
+    metrics = metrics.merge(snap, on="city", how="left")
+
+    for col in [
+        "avg_salary",
+        "avg_rent",
+        "rent_income_ratio",
+        "urban_employment_wan",
+        "population_wan",
+        "gdp_per_capita",
+        "gdp_snapshot_yi",
+        "job_count",
+    ]:
         if metrics[col].isna().any():
             metrics[col] = metrics[col].fillna(metrics[col].median())
             source_notes.append(f"提示：{col} 存在缺失，已用中位数填充。")
-    metrics["job_count"] = (
-        metrics["job_count"].fillna(metrics["job_count"].median()).astype(int)
-    )
 
+    source_notes.extend(
+        [
+            f"薪资数据：城镇非私营单位在岗职工平均工资/12（{BASE_YEAR}，data/job_data.csv）。",
+            f"租金数据：商品房平均出租价格×50㎡（{BASE_YEAR}，data/rent_data.xlsx）。",
+            "人口口径：city_snapshot.csv 的 population_wan，用于人均和每万人指标。",
+            "岗位规模：以城镇非私营单位从业人员数代理。",
+        ]
+    )
     return metrics, source_notes
 
 
-def calculate_ycsi(metrics: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def calculate_ycsi(metrics: pd.DataFrame) -> pd.DataFrame:
     metrics = metrics.copy()
+
+    metrics["population_for_rate_wan"] = metrics["population_wan"]
+    metrics["job_per_10k"] = safe_per_10k(metrics["job_count"], metrics["population_for_rate_wan"])
+    metrics["university_per_10k"] = safe_per_10k(
+        metrics["university_count"], metrics["population_for_rate_wan"]
+    )
+    metrics["metro_line_per_10k"] = safe_per_10k(
+        metrics["metro_lines"], metrics["population_for_rate_wan"]
+    )
+    metrics["poi_total"] = metrics[POI_COLS].sum(axis=1)
+    metrics["poi_per_10k"] = safe_per_10k(metrics["poi_total"], metrics["population_for_rate_wan"])
+    for col in POI_COLS:
+        metrics[f"{col}_per_10k"] = safe_per_10k(
+            metrics[col], metrics["population_for_rate_wan"]
+        )
+    metrics["subway_per_10k"] = metrics["subway_per_10k"].fillna(0)
 
     metrics["opportunity_score"] = (
         0.45 * minmax(metrics["avg_salary"])
-        + 0.40 * minmax(metrics["job_count"])
-        + 0.15 * minmax(metrics["gdp"])
+        + 0.40 * minmax(metrics["job_per_10k"])
+        + 0.15 * minmax(metrics["tertiary_industry_pct"])
     )
+    metrics["housing_friendliness"] = 1 - minmax(metrics["rent_income_ratio"])
 
-    metrics["rent_pressure"] = minmax(metrics["rent_income_ratio"])
-
-    # 生活便利度按 POI 绝对总量衡量（可达的选择多寡），而非人均。
-    # 人均会惩罚大城市规模优势（如北京餐饮5591家被巨大人口稀释为人均垫底），
-    # 与"城市能提供多少便利"的直觉相悖。总量同时避免了人口口径问题。
-    poi_scaled = metrics[POI_COLS].apply(minmax)
-    poi_weights = pd.Series(
-        {
-            "subway": 0.18,
-            "hospital": 0.16,
-            "park": 0.14,
-            "mall": 0.14,
-            "restaurant": 0.16,
-            "library": 0.10,
-            "gym": 0.12,
-        }
+    commute_access = (
+        0.70 * minmax(metrics["subway_per_10k"])
+        + 0.30 * minmax(metrics["metro_line_per_10k"])
     )
-    metrics["life_score"] = minmax((poi_scaled * poi_weights).sum(axis=1))
+    metrics["commute_friendliness"] = minmax(commute_access)
 
-    metrics["gdp_per_capita"] = metrics["gdp"] * 10000 / metrics["population"].replace(0, np.nan)
+    poi_rate_cols = [f"{col}_per_10k" for col in POI_COLS]
+    poi_scaled = metrics[poi_rate_cols].apply(minmax)
+    metrics["life_score"] = minmax((poi_scaled * POI_WEIGHTS).sum(axis=1))
+
     metrics["growth_score"] = (
-        0.30 * minmax(metrics["gdp_per_capita"])
+        0.35 * minmax(metrics["gdp_per_capita"])
         + 0.30 * minmax(metrics["disposable_income"])
-        + 0.25 * minmax(metrics["university_count"])
+        + 0.20 * minmax(metrics["university_per_10k"])
         + 0.15 * minmax(metrics["tertiary_industry_pct"])
     )
 
-    # 通勤压力以城区就业规模为主，而非户籍人口（避免郊县人口虚高拉满压力）。
-    commute_raw = (
-        0.42 * minmax(metrics["job_count"])
-        + 0.24 * minmax(metrics["gdp"])
-        + 0.14 * minmax(metrics["avg_rent"])
-        - 0.20 * minmax(metrics["metro_lines"])
-    )
-    metrics["commute_score"] = minmax(commute_raw)
+    for col, weight in DIMENSION_WEIGHTS.items():
+        metrics[f"{col}_contribution"] = metrics[col] * weight * 100
 
-    metrics["ycsi_raw"] = (
-        WEIGHTS["opportunity"] * metrics["opportunity_score"]
-        + WEIGHTS["life"] * metrics["life_score"]
-        + WEIGHTS["growth"] * metrics["growth_score"]
-        - WEIGHTS["rent"] * metrics["rent_pressure"]
-        - WEIGHTS["commute"] * metrics["commute_score"]
+    metrics["ycsi_raw"] = sum(
+        metrics[col] * weight for col, weight in DIMENSION_WEIGHTS.items()
     )
-    # 线性映射到 [SCORE_FLOOR, SCORE_CEIL]，避免 min-max 把首尾城市钉死为 0/100。
-    # YCSI 是相对指数：最低城市仍有基础分，最高城市不取满分。
-    raw = metrics["ycsi_raw"]
-    span = raw.max() - raw.min()
-    if pd.isna(span) or span == 0:
-        scaled = pd.Series(np.full(len(raw), (SCORE_FLOOR + SCORE_CEIL) / 2), index=raw.index)
-    else:
-        scaled = SCORE_FLOOR + (raw - raw.min()) / span * (SCORE_CEIL - SCORE_FLOOR)
-    metrics["ycsi"] = scaled.round(2)
+    metrics["ycsi"] = (metrics["ycsi_raw"] * 100).round(2)
     metrics["rank"] = metrics["ycsi"].rank(ascending=False, method="first").astype(int)
-    metrics["rent_friendliness"] = 1 - metrics["rent_pressure"]
-    metrics["commute_friendliness"] = 1 - metrics["commute_score"]
 
-    return metrics, poi_scaled
+    # 兼容部分旧输出字段名，但后续图表只使用友好度方向。
+    metrics["rent_pressure"] = 1 - metrics["housing_friendliness"]
+    metrics["commute_score"] = 1 - metrics["commute_friendliness"]
+    metrics["rent_friendliness"] = metrics["housing_friendliness"]
+
+    return metrics
 
 
 def plot_ycsi_ranking(metrics: pd.DataFrame) -> Path:
-    plot_df = metrics.sort_values("ycsi", ascending=True)
-    colors = plt.cm.viridis(minmax(plot_df["ycsi"]))
-    fig, ax = plt.subplots(figsize=(9.5, 7))
-    ax.barh(plot_df["city"], plot_df["ycsi"], color=colors, edgecolor="white", linewidth=0.8)
-    for _, row in plot_df.iterrows():
-        ax.text(row["ycsi"] + 1.0, row["city"], f"{row['ycsi']:.1f}", va="center", fontsize=9)
-    ax.set_xlim(0, SCORE_CEIL + 10)
-    ax.set_xlabel(f"YCSI 综合得分（相对指数，{SCORE_FLOOR:.0f}-{SCORE_CEIL:.0f}）")
-    ax.set_title("15 城青年城市生存力指数排名")
-    ax.grid(axis="x", alpha=0.25)
+    plot_df = metrics.sort_values("ycsi", ascending=True).reset_index(drop=True)
+    fig, ax = plt.subplots(figsize=(11, 8))
+
+    contribution_cols = [f"{col}_contribution" for col in DIMENSION_COLS.values()]
+    labels = list(DIMENSION_COLS.keys())
+    left = np.zeros(len(plot_df))
+
+    focus_cities = set(metrics.nsmallest(3, "rank")["city"]).union(
+        set(metrics.nlargest(3, "rank")["city"])
+    )
+    for label, dim_col, contrib_col in zip(labels, DIMENSION_COLS.values(), contribution_cols):
+        bars = ax.barh(
+            plot_df["city"],
+            plot_df[contrib_col],
+            left=left,
+            color=DIMENSION_PALETTE[dim_col],
+            edgecolor="white",
+            linewidth=0.6,
+            label=label,
+        )
+        for bar, city in zip(bars, plot_df["city"]):
+            bar.set_alpha(0.98 if city in focus_cities else 0.62)
+        left += plot_df[contrib_col].to_numpy()
+
+    for idx, row in plot_df.iterrows():
+        color = COLORS["text"] if row["city"] in focus_cities else "#6d7680"
+        weight = "bold" if row["city"] in focus_cities else "normal"
+        ax.text(
+            row["ycsi"] + 0.8,
+            idx,
+            f"{row['ycsi']:.1f}",
+            va="center",
+            fontsize=9,
+            color=color,
+            fontweight=weight,
+        )
+
+    ax.set_xlim(0, max(100, plot_df["ycsi"].max() + 8))
+    ax.set_xlabel("YCSI 综合得分（0-100，五维加权贡献）")
+    ax.set_title("15 城青年城市生存力指数排名与五维贡献")
+    ax.grid(axis="x", alpha=0.22, color=COLORS["grid"])
     ax.spines[["top", "right", "left"]].set_visible(False)
+    ax.legend(title="五维贡献", ncol=5, frameon=False, loc="lower right")
+    fig.text(
+        0.08,
+        0.015,
+        "公式：YCSI = 0.30×机会 + 0.20×居住友好 + 0.10×通勤友好 + 0.20×生活便利 + 0.20×成长潜力",
+        fontsize=9,
+        color="#5a6470",
+    )
     return save_figure("01_ycsi_ranking.png")
 
 
-def plot_city_heat_points(metrics: pd.DataFrame) -> Path:
-    fig, ax = plt.subplots(figsize=(9, 7))
-    size = 120 + minmax(metrics["population"]) * 620
+def annotate_city(ax: plt.Axes, row: pd.Series, fontsize: float = 8.4) -> None:
+    offsets = {
+        "上海": (0.30, -0.38),
+        "苏州": (0.28, 0.16),
+        "杭州": (-1.10, -0.28),
+        "南京": (-1.10, 0.24),
+        "深圳": (0.28, 0.12),
+        "广州": (-0.95, 0.34),
+        "天津": (0.16, 0.20),
+    }
+    dx, dy = offsets.get(row["city"], (0.18, 0.14))
+    ax.text(row["lng"] + dx, row["lat"] + dy, row["city"], fontsize=fontsize)
+
+
+def add_size_legend(ax: plt.Axes, values: pd.Series, label: str) -> None:
+    quantiles = values.quantile([0.25, 0.5, 0.75]).round(0).astype(int).tolist()
+    seen: set[int] = set()
+    handles = []
+    for value in quantiles:
+        if value in seen:
+            continue
+        seen.add(value)
+        handles.append(
+            ax.scatter(
+                [],
+                [],
+                s=float(scale_bubble(pd.Series([values.min(), value, values.max()])).iloc[1]),
+                facecolors="none",
+                edgecolors="#6b7280",
+                linewidth=0.8,
+                label=f"{value:,}",
+            )
+        )
+    if handles:
+        legend = ax.legend(
+            handles=handles,
+            title=label,
+            frameon=False,
+            loc="lower left",
+            borderpad=0.3,
+            labelspacing=1.1,
+        )
+        ax.add_artist(legend)
+
+
+def plot_city_spatial_distribution(metrics: pd.DataFrame) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 7.6))
+    size = scale_bubble(metrics["population_wan"], 110, 760)
     scatter = ax.scatter(
         metrics["lng"],
         metrics["lat"],
         c=metrics["ycsi"],
         s=size,
-        cmap="YlOrRd",
-        edgecolor="#333333",
-        linewidth=0.7,
+        cmap="Purples",
+        edgecolor="#253040",
+        linewidth=0.75,
         alpha=0.88,
     )
     for _, row in metrics.iterrows():
-        ax.text(row["lng"] + 0.18, row["lat"] + 0.12, row["city"], fontsize=8.5)
+        annotate_city(ax, row)
+
     ax.set_xlim(102, 123)
     ax.set_ylim(21, 41)
     ax.set_xlabel("经度")
     ax.set_ylabel("纬度")
-    ax.set_title("15 城 YCSI 空间分布（点状热力图）")
-    ax.grid(alpha=0.22)
-    color_bar = plt.colorbar(scatter, ax=ax, shrink=0.82)
-    color_bar.set_label("YCSI 得分")
+    ax.set_title("15城青年城市生存力空间分布")
+    ax.grid(alpha=0.22, color=COLORS["grid"])
+    color_bar = plt.colorbar(scatter, ax=ax, shrink=0.78, pad=0.02)
+    color_bar.set_label("YCSI 综合得分")
+    add_size_legend(ax, metrics["population_wan"], "气泡面积：人口（万人）")
+
+    inset = inset_axes(ax, width="36%", height="36%", loc="lower right", borderpad=1.0)
+    local = metrics[metrics["city"].isin(YANGTZE_DELTA_CITIES)]
+    inset.scatter(
+        local["lng"],
+        local["lat"],
+        c=local["ycsi"],
+        s=scale_bubble(local["population_wan"], 120, 520),
+        cmap="Purples",
+        edgecolor="#253040",
+        linewidth=0.7,
+        alpha=0.9,
+        vmin=metrics["ycsi"].min(),
+        vmax=metrics["ycsi"].max(),
+    )
+    for _, row in local.iterrows():
+        annotate_city(inset, row, fontsize=8)
+    inset.set_title("长三角局部", fontsize=9)
+    inset.set_xlim(118.0, 122.4)
+    inset.set_ylim(29.6, 32.7)
+    inset.grid(alpha=0.20, color=COLORS["grid"])
+    inset.tick_params(labelsize=7)
+
+    fig.text(
+        0.10,
+        0.015,
+        "说明：当前版本为经纬度气泡空间分布图，未引入外部地图底图；颜色表示YCSI，气泡面积表示人口。",
+        fontsize=8.8,
+        color="#5a6470",
+    )
     return save_figure("02_ycsi_city_heat_points.png")
 
 
@@ -427,22 +616,22 @@ def plot_salary_rent_bubble(metrics: pd.DataFrame) -> Path:
 
     def classify(row: pd.Series) -> str:
         high_salary = row["avg_salary"] >= salary_median
-        high_pressure = row["rent_income_ratio"] >= ratio_median
-        if high_salary and high_pressure:
-            return "高薪高压"
-        if high_salary and not high_pressure:
-            return "高薪宜居"
-        if not high_salary and high_pressure:
-            return "低薪高压"
-        return "低压稳健"
+        high_burden = row["rent_income_ratio"] >= ratio_median
+        if high_salary and high_burden:
+            return "高薪-高负担"
+        if high_salary and not high_burden:
+            return "高薪-低负担"
+        if not high_salary and high_burden:
+            return "低薪-高负担"
+        return "低薪-低负担"
 
     plot_df = metrics.copy()
     plot_df["salary_rent_quadrant"] = plot_df.apply(classify, axis=1)
     palette = {
-        "高薪高压": "#d73027",
-        "高薪宜居": "#1a9850",
-        "低薪高压": "#fdae61",
-        "低压稳健": "#4575b4",
+        "高薪-高负担": COLORS["pressure"],
+        "高薪-低负担": COLORS["housing"],
+        "低薪-高负担": "#e7a66a",
+        "低薪-低负担": "#8aa6c8",
     }
 
     fig, ax = plt.subplots(figsize=(10, 7))
@@ -450,7 +639,7 @@ def plot_salary_rent_bubble(metrics: pd.DataFrame) -> Path:
         ax.scatter(
             group["avg_salary"],
             group["rent_income_ratio"],
-            s=120 + minmax(group["job_count"]) * 900,
+            s=scale_bubble(group["job_count"], 130, 980),
             color=palette[name],
             alpha=0.78,
             edgecolor="white",
@@ -458,246 +647,432 @@ def plot_salary_rent_bubble(metrics: pd.DataFrame) -> Path:
             label=name,
         )
         for _, row in group.iterrows():
-            ax.text(row["avg_salary"] + 55, row["rent_income_ratio"] + 0.003, row["city"], fontsize=8.5)
+            ax.text(
+                row["avg_salary"] + 55,
+                row["rent_income_ratio"] + 0.003,
+                row["city"],
+                fontsize=8.5,
+            )
+
     ax.axvline(salary_median, color="#555555", linestyle="--", linewidth=1)
     ax.axhline(ratio_median, color="#555555", linestyle="--", linewidth=1)
     ax.yaxis.set_major_formatter(PercentFormatter(1.0))
-    ax.set_xlabel("平均月薪")
-    ax.set_ylabel("租金收入比")
-    ax.set_title("工资 vs 租金收入比气泡图（气泡大小=岗位数量）")
-    ax.grid(alpha=0.22)
-    ax.legend(title="城市类型", frameon=False, loc="best")
+    ax.set_xlabel("平均月薪（元/月）")
+    ax.set_ylabel("住房负担：月租金 / 平均月薪")
+    ax.set_title("城市平均月薪与住房负担关系")
+    ax.grid(alpha=0.22, color=COLORS["grid"])
+    ax.legend(title="中位数划分", frameon=False, loc="best")
+    ax.text(
+        0.01,
+        -0.13,
+        "虚线为15城中位数；气泡面积表示岗位规模代理（城镇非私营单位从业人员数），散点面积与岗位规模成正比。",
+        transform=ax.transAxes,
+        fontsize=8.8,
+        color="#5a6470",
+    )
     return save_figure("03_salary_rent_bubble.png")
 
 
-def plot_opportunity_pressure_quadrant(metrics: pd.DataFrame) -> Path:
+def plot_opportunity_housing_quadrant(metrics: pd.DataFrame) -> Path:
     opp_median = metrics["opportunity_score"].median()
-    pressure_median = metrics["rent_pressure"].median()
+    housing_median = metrics["housing_friendliness"].median()
 
-    def classify(row: pd.Series) -> str:
-        high_opp = row["opportunity_score"] >= opp_median
-        high_pressure = row["rent_pressure"] >= pressure_median
-        if high_opp and high_pressure:
-            return "高机会高压力"
-        if high_opp and not high_pressure:
-            return "高机会低压力"
-        if not high_opp and high_pressure:
-            return "低机会高压力"
-        return "低机会低压力"
+    fig, ax = plt.subplots(figsize=(9.5, 7.2))
+    ax.add_patch(Rectangle((0, housing_median), opp_median, 1, color="#eaf5ef", alpha=0.55, zorder=0))
+    ax.add_patch(Rectangle((opp_median, housing_median), 1, 1, color="#e8f1fb", alpha=0.55, zorder=0))
+    ax.add_patch(Rectangle((0, 0), opp_median, housing_median, color="#f2f4f7", alpha=0.70, zorder=0))
+    ax.add_patch(Rectangle((opp_median, 0), 1, housing_median, color="#fff4e8", alpha=0.70, zorder=0))
 
-    plot_df = metrics.copy()
-    plot_df["index_quadrant"] = plot_df.apply(classify, axis=1)
-    palette = {
-        "高机会高压力": "#d7191c",
-        "高机会低压力": "#2c7bb6",
-        "低机会高压力": "#fdae61",
-        "低机会低压力": "#abd9e9",
+    scatter = ax.scatter(
+        metrics["opportunity_score"],
+        metrics["housing_friendliness"],
+        s=scale_bubble(metrics["ycsi"], 130, 720),
+        c=metrics["ycsi"],
+        cmap="Purples",
+        edgecolor="white",
+        linewidth=0.9,
+        alpha=0.90,
+        zorder=3,
+    )
+    label_offsets = {
+        "重庆": (-0.030, 0.018),
+        "郑州": (-0.020, 0.038),
+        "长沙": (0.020, 0.027),
+        "武汉": (0.016, -0.020),
+        "西安": (0.015, 0.026),
+        "青岛": (0.014, 0.018),
+        "天津": (0.014, -0.025),
+        "成都": (0.012, -0.025),
+        "深圳": (0.014, -0.028),
+        "北京": (0.014, 0.012),
+        "上海": (0.014, 0.012),
     }
-
-    fig, ax = plt.subplots(figsize=(9, 7))
-    for name, group in plot_df.groupby("index_quadrant"):
-        ax.scatter(
-            group["opportunity_score"],
-            group["rent_pressure"],
-            s=120 + group["ycsi"] * 5,
-            color=palette[name],
-            alpha=0.82,
-            edgecolor="white",
-            linewidth=0.8,
-            label=name,
+    for _, row in metrics.iterrows():
+        dx, dy = label_offsets.get(row["city"], (0.012, 0.012))
+        ax.text(
+            row["opportunity_score"] + dx,
+            row["housing_friendliness"] + dy,
+            row["city"],
+            fontsize=8.2,
+            zorder=4,
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.55, "pad": 0.4},
         )
-        for _, row in group.iterrows():
-            ax.text(row["opportunity_score"] + 0.012, row["rent_pressure"] + 0.012, row["city"], fontsize=8.5)
+
     ax.axvline(opp_median, color="#555555", linestyle="--", linewidth=1)
-    ax.axhline(pressure_median, color="#555555", linestyle="--", linewidth=1)
-    ax.text(0.77, 0.94, "高机会\n高压力", ha="center", va="center", fontsize=11, color="#8b0000")
-    ax.text(0.77, 0.08, "高机会\n低压力", ha="center", va="center", fontsize=11, color="#0b4f6c")
-    ax.set_xlabel("机会指数")
-    ax.set_ylabel("居住压力指数（越高压力越大）")
-    ax.set_title("城市机会-居住压力四象限")
+    ax.axhline(housing_median, color="#555555", linestyle="--", linewidth=1)
+    ax.text(0.09, housing_median + 0.06, "低机会\n高居住友好", ha="center", va="center", fontsize=10, color=COLORS["housing"])
+    ax.text(0.88, 0.92, "高机会\n高居住友好", ha="center", va="center", fontsize=10, color=COLORS["opportunity"])
+    ax.text(0.88, 0.10, "高机会\n低居住友好", ha="center", va="center", fontsize=10, color=COLORS["pressure"])
+    ax.text(
+        0.02,
+        -0.15,
+        "结论：在所选15座城市中，没有城市同时实现顶级就业机会和极低居住压力；虚线为15城中位数。",
+        transform=ax.transAxes,
+        fontsize=8.8,
+        color="#5a6470",
+    )
+    ax.set_xlabel("机会指数（越高越好）")
+    ax.set_ylabel("居住友好度（越高住房负担越低）")
+    ax.set_title("城市机会指数与居住友好度四象限")
     ax.set_xlim(-0.04, 1.04)
     ax.set_ylim(-0.04, 1.04)
-    ax.grid(alpha=0.22)
-    ax.legend(frameon=False, loc="best")
+    ax.grid(alpha=0.22, color=COLORS["grid"])
+    color_bar = plt.colorbar(scatter, ax=ax, shrink=0.78)
+    color_bar.set_label("YCSI 综合得分")
     return save_figure("04_opportunity_pressure_quadrant.png")
 
 
-def plot_city_radar(metrics: pd.DataFrame) -> Path:
-    radar_map = {
-        "机会": "opportunity_score",
-        "居住友好": "rent_friendliness",
-        "通勤友好": "commute_friendliness",
-        "生活便利": "life_score",
-        "成长潜力": "growth_score",
-    }
-    labels = list(radar_map.keys())
-    columns = list(radar_map.values())
-
-    selected: list[str] = []
-    selected.extend(metrics.sort_values("ycsi", ascending=False)["city"].head(2).tolist())
-    selected.extend(metrics.sort_values("rent_pressure", ascending=True)["city"].head(2).tolist())
-    selected.extend(metrics.sort_values("growth_score", ascending=False)["city"].head(2).tolist())
-    selected = list(dict.fromkeys(selected))[:5]
-
-    angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
-    angles += angles[:1]
-    fig, ax = plt.subplots(figsize=(8.2, 8.2), subplot_kw={"polar": True})
-    for city in selected:
-        values = metrics.loc[metrics["city"] == city, columns].iloc[0].tolist()
-        values += values[:1]
-        ax.plot(angles, values, linewidth=2, label=city)
-        ax.fill(angles, values, alpha=0.08)
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(labels, fontsize=11)
-    ax.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
-    ax.set_ylim(0, 1)
-    ax.set_title("典型城市 YCSI 五维雷达图", y=1.08)
-    ax.legend(loc="upper right", bbox_to_anchor=(1.25, 1.08), frameon=False)
-    return save_figure("05_city_radar.png")
+def plot_life_score_dot(metrics: pd.DataFrame) -> Path:
+    plot_df = metrics.sort_values("life_score", ascending=True)
+    fig, ax = plt.subplots(figsize=(9.2, 7))
+    ax.scatter(
+        plot_df["life_score"],
+        plot_df["city"],
+        s=scale_bubble(plot_df["poi_per_10k"], 90, 560),
+        color=COLORS["life"],
+        edgecolor="white",
+        linewidth=0.8,
+        alpha=0.88,
+    )
+    for _, row in plot_df.iterrows():
+        ax.text(row["life_score"] + 0.015, row["city"], f"{row['life_score']:.2f}", va="center", fontsize=8.5)
+    ax.set_xlim(0, 1.08)
+    ax.set_xlabel("生活便利度综合得分（按每万人POI标准化）")
+    ax.set_ylabel("城市")
+    ax.set_title("生活便利综合得分点图")
+    ax.grid(axis="x", alpha=0.22, color=COLORS["grid"])
+    ax.spines[["top", "right", "left"]].set_visible(False)
+    fig.text(
+        0.08,
+        0.015,
+        "气泡面积表示每万人POI总量；得分由地铁、医院、公园、商场、餐饮、图书馆、健身房等人均指标加权得到。",
+        fontsize=8.8,
+        color="#5a6470",
+    )
+    return save_figure("06a_life_score_dot.png")
 
 
-def plot_poi_stack(metrics: pd.DataFrame, poi_scaled: pd.DataFrame) -> Path:
-    display_names = {
-        "subway": "地铁",
-        "hospital": "医院",
-        "park": "公园",
-        "mall": "商场",
-        "restaurant": "餐饮",
-        "library": "图书馆",
-        "gym": "健身房",
-    }
-    poi_components = poi_scaled.copy()
-    poi_components.index = metrics["city"]
-    poi_components = poi_components.loc[metrics.sort_values("life_score", ascending=False)["city"]]
-    poi_components = poi_components.rename(columns=display_names)
+def plot_poi_composition_100pct(metrics: pd.DataFrame) -> Path:
+    plot_df = metrics.sort_values("life_score", ascending=False).copy()
+    poi_share = plot_df[POI_COLS].div(plot_df[POI_COLS].sum(axis=1), axis=0)
+    poi_share.index = plot_df["city"]
+    poi_share = poi_share.rename(columns=POI_DISPLAY)
+
     fig, ax = plt.subplots(figsize=(11, 7))
-    poi_components.plot(kind="bar", stacked=True, ax=ax, colormap="tab20c", width=0.72)
-    ax.set_ylabel("POI 综合量（按总量标准化）")
+    poi_share.plot(kind="bar", stacked=True, ax=ax, colormap="tab20c", width=0.74)
+    ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax.set_ylim(0, 1)
+    ax.set_ylabel("各类POI占比")
     ax.set_xlabel("城市")
-    ax.set_title("生活便利 POI 构成对比")
-    ax.grid(axis="y", alpha=0.22)
+    ax.set_title("各类 POI 构成 100% 堆积图")
+    ax.grid(axis="y", alpha=0.22, color=COLORS["grid"])
     ax.legend(title="POI 类型", bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
     plt.xticks(rotation=35, ha="right")
-    return save_figure("06_poi_convenience_stack.png")
+    return save_figure("06b_poi_composition_100pct.png")
 
 
-def plot_correlation_heatmap(metrics: pd.DataFrame) -> Path:
-    columns = [
-        "ycsi",
-        "avg_salary",
-        "avg_rent",
-        "rent_income_ratio",
-        "job_count",
-        "opportunity_score",
-        "rent_pressure",
-        "life_score",
-        "growth_score",
-        "commute_score",
-    ]
-    labels = [
-        "YCSI",
-        "月薪",
-        "租金",
-        "租金收入比",
-        "岗位数",
-        "机会",
-        "居住压力",
-        "生活便利",
-        "成长",
-        "通勤压力",
-    ]
-    corr = metrics[columns].corr()
+def correlation_and_pvalue(frame: pd.DataFrame, method: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    columns = list(frame.columns)
+    corr = pd.DataFrame(np.eye(len(columns)), index=columns, columns=columns, dtype=float)
+    pvalue = pd.DataFrame(np.zeros((len(columns), len(columns))), index=columns, columns=columns, dtype=float)
+    for i, col_i in enumerate(columns):
+        for j, col_j in enumerate(columns):
+            if i == j:
+                continue
+            x = pd.to_numeric(frame[col_i], errors="coerce")
+            y = pd.to_numeric(frame[col_j], errors="coerce")
+            valid = x.notna() & y.notna()
+            if valid.sum() < 3:
+                corr.loc[col_i, col_j] = np.nan
+                pvalue.loc[col_i, col_j] = np.nan
+                continue
+            if method == "spearman":
+                result = stats.spearmanr(x[valid], y[valid])
+            else:
+                result = stats.pearsonr(x[valid], y[valid])
+            corr.loc[col_i, col_j] = result.statistic
+            pvalue.loc[col_i, col_j] = result.pvalue
+    return corr, pvalue
+
+
+def hclust_order(corr: pd.DataFrame) -> list[str]:
+    if len(corr) <= 2:
+        return list(corr.columns)
+    values = corr.abs().fillna(0).to_numpy()
+    np.fill_diagonal(values, 1)
+    distances = np.clip(1 - values, 0, 1)
+    condensed = squareform(distances, checks=False)
+    cluster = linkage(condensed, method="average")
+    return corr.columns[leaves_list(cluster)].tolist()
+
+
+def plot_lower_triangle_heatmap(
+    data: pd.DataFrame,
+    labels: dict[str, str],
+    title: str,
+    filename: str,
+    csv_prefix: str,
+) -> Path:
+    pearson, pearson_p = correlation_and_pvalue(data, "pearson")
+    spearman, spearman_p = correlation_and_pvalue(data, "spearman")
+
+    order = hclust_order(pearson)
+    pearson = pearson.loc[order, order]
+    pearson_p = pearson_p.loc[order, order]
+    spearman.loc[order, order].to_csv(
+        OUTPUT_DIR / f"{csv_prefix}_spearman.csv", encoding="utf-8-sig"
+    )
+    pearson.to_csv(OUTPUT_DIR / f"{csv_prefix}_pearson.csv", encoding="utf-8-sig")
+    pearson_p.to_csv(OUTPUT_DIR / f"{csv_prefix}_pearson_pvalue.csv", encoding="utf-8-sig")
+    spearman_p.loc[order, order].to_csv(
+        OUTPUT_DIR / f"{csv_prefix}_spearman_pvalue.csv", encoding="utf-8-sig"
+    )
+
+    corr_values = pearson.to_numpy()
+    mask = np.triu(np.ones_like(corr_values, dtype=bool))
+    display = np.ma.masked_where(mask, corr_values)
+    lower = corr_values[np.tril_indices_from(corr_values, k=-1)]
+    finite_lower = lower[np.isfinite(lower)]
+    all_positive = len(finite_lower) > 0 and finite_lower.min() >= 0
+    cmap = plt.cm.YlOrRd.copy() if all_positive else plt.cm.RdBu_r.copy()
+    cmap.set_bad(color="white")
+    vmin, vmax = (0, 1) if all_positive else (-1, 1)
+
     fig, ax = plt.subplots(figsize=(9.5, 8))
-    image = ax.imshow(corr, cmap="RdBu_r", vmin=-1, vmax=1)
-    ax.set_xticks(range(len(labels)))
-    ax.set_yticks(range(len(labels)))
-    ax.set_xticklabels(labels, rotation=45, ha="right")
-    ax.set_yticklabels(labels)
-    for row_idx in range(corr.shape[0]):
-        for col_idx in range(corr.shape[1]):
-            value = corr.iloc[row_idx, col_idx]
-            color = "white" if abs(value) > 0.55 else "#222222"
-            ax.text(col_idx, row_idx, f"{value:.2f}", ha="center", va="center", fontsize=8, color=color)
-    ax.set_title("核心指标相关性热力图")
-    color_bar = plt.colorbar(image, ax=ax, shrink=0.82)
+    image = ax.imshow(display, cmap=cmap, vmin=vmin, vmax=vmax)
+    axis_labels = [labels[col] for col in order]
+    ax.set_xticks(range(len(order)))
+    ax.set_yticks(range(len(order)))
+    ax.set_xticklabels(axis_labels, rotation=45, ha="right")
+    ax.set_yticklabels(axis_labels)
+
+    for row_idx in range(len(order)):
+        for col_idx in range(len(order)):
+            if row_idx <= col_idx:
+                continue
+            value = pearson.iloc[row_idx, col_idx]
+            p_val = pearson_p.iloc[row_idx, col_idx]
+            if pd.isna(value):
+                text = ""
+            elif pd.notna(p_val) and p_val >= 0.10:
+                text = "×"
+            else:
+                text = f"{value:.2f}"
+            color = "white" if abs(value) > 0.62 and text != "×" else "#253040"
+            if text == "×":
+                color = "#9aa1aa"
+            ax.text(col_idx, row_idx, text, ha="center", va="center", fontsize=8.5, color=color)
+
+    ax.set_title(title)
+    color_bar = plt.colorbar(image, ax=ax, shrink=0.80)
     color_bar.set_label("Pearson 相关系数")
-    return save_figure("07_metric_correlation_heatmap.png")
+    ax.text(
+        0,
+        -0.16,
+        "仅展示下三角；× 表示 Pearson 相关在 p<0.10 下不显著；Spearman 结果另存为 CSV。",
+        transform=ax.transAxes,
+        fontsize=8.8,
+        color="#5a6470",
+    )
+    return save_figure(filename)
 
 
-def plot_city_clusters(metrics: pd.DataFrame) -> tuple[Path, pd.DataFrame]:
+def plot_correlation_heatmaps(metrics: pd.DataFrame) -> list[Path]:
+    raw_columns = {
+        "avg_salary": "平均月薪",
+        "avg_rent": "平均租金",
+        "rent_income_ratio": "租金收入比",
+        "job_per_10k": "每万人岗位",
+        "gdp_per_capita": "人均GDP",
+        "disposable_income": "人均可支配收入",
+        "tertiary_industry_pct": "第三产业占比",
+        "university_per_10k": "每万人高校",
+        "subway_per_10k": "每万人地铁",
+        "poi_per_10k": "每万人POI",
+    }
+    dim_columns = {
+        "opportunity_score": "机会指数",
+        "housing_friendliness": "居住友好",
+        "commute_friendliness": "通勤友好",
+        "life_score": "生活便利",
+        "growth_score": "成长潜力",
+    }
+    return [
+        plot_lower_triangle_heatmap(
+            metrics[list(raw_columns.keys())],
+            raw_columns,
+            "原始变量相关性热力图",
+            "07a_raw_variable_correlation_heatmap.png",
+            "07a_raw_variable_correlation",
+        ),
+        plot_lower_triangle_heatmap(
+            metrics[list(dim_columns.keys())],
+            dim_columns,
+            "五个一级指标相关性热力图",
+            "07b_dimension_correlation_heatmap.png",
+            "07b_dimension_correlation",
+        ),
+    ]
+
+
+def name_cluster(center: pd.Series, center_median: pd.Series) -> str:
+    high = center >= center_median
+    if high["opportunity_score"] and not high["housing_friendliness"]:
+        return "超级机会-高成本型"
+    if high["housing_friendliness"] and high["life_score"] and not high["opportunity_score"]:
+        return "生活友好-中等机会型"
+    if high["housing_friendliness"] and high["growth_score"]:
+        return "低成本-成长潜力型"
+    if high.mean() >= 0.6:
+        return "综合均衡型"
+    top_feature = center.idxmax()
+    return {
+        "opportunity_score": "机会导向型",
+        "housing_friendliness": "居住友好型",
+        "commute_friendliness": "通勤友好型",
+        "life_score": "生活便利型",
+        "growth_score": "成长潜力型",
+    }.get(top_feature, "综合过渡型")
+
+
+def plot_city_clusters(metrics: pd.DataFrame) -> tuple[Path, pd.DataFrame, pd.DataFrame, list[str]]:
+    feature_cols = list(DIMENSION_COLS.values())
     plot_df = metrics.copy()
-    kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
-    plot_df["cluster_id"] = kmeans.fit_predict(plot_df[YCSI_FEATURES])
-    centers = pd.DataFrame(kmeans.cluster_centers_, columns=YCSI_FEATURES)
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(plot_df[feature_cols])
 
-    cluster_names: dict[int, str] = {}
-    used_names: dict[str, int] = {}
+    candidates: list[tuple[int, float, np.ndarray, KMeans]] = []
+    for k in (3, 4):
+        model = KMeans(n_clusters=k, random_state=42, n_init=30)
+        labels = model.fit_predict(scaled)
+        score = silhouette_score(scaled, labels)
+        candidates.append((k, score, labels, model))
+    best_k, best_score, labels, model = max(candidates, key=lambda item: item[1])
+    plot_df["cluster_id"] = labels
+
+    centers = plot_df.groupby("cluster_id")[feature_cols].mean()
     center_median = centers.median()
-    for cluster_id, row in centers.iterrows():
-        opp_high = row["opportunity_score"] >= center_median["opportunity_score"]
-        pressure_high = row["rent_pressure"] >= center_median["rent_pressure"]
-        life_high = row["life_score"] >= center_median["life_score"]
-        growth_high = row["growth_score"] >= center_median["growth_score"]
-        commute_high = row["commute_score"] >= center_median["commute_score"]
-        if opp_high and pressure_high and commute_high:
-            name = "高机会高压力型"
-        elif opp_high and not pressure_high:
-            name = "机会友好型"
-        elif opp_high and pressure_high:
-            name = "机会成长型"
-        elif (not opp_high) and (not pressure_high) and commute_high:
-            name = "大城通勤压力型"
-        elif growth_high and not pressure_high:
-            name = "潜力成长型"
-        elif life_high and not commute_high:
-            name = "舒适均衡型"
-        elif not pressure_high:
-            name = "低压稳健型"
-        else:
-            name = "综合过渡型"
-        used_names[name] = used_names.get(name, 0) + 1
-        cluster_names[int(cluster_id)] = name if used_names[name] == 1 else f"{name}-{used_names[name]}"
-
+    raw_names = {cluster_id: name_cluster(row, center_median) for cluster_id, row in centers.iterrows()}
+    name_counts: dict[str, int] = {}
+    cluster_names: dict[int, str] = {}
+    for cluster_id in sorted(raw_names):
+        name = raw_names[cluster_id]
+        name_counts[name] = name_counts.get(name, 0) + 1
+        cluster_names[cluster_id] = name if name_counts[name] == 1 else f"{name}-{name_counts[name]}"
     plot_df["cluster_name"] = plot_df["cluster_id"].map(cluster_names)
-    fig, ax = plt.subplots(figsize=(9.5, 7))
+
+    representatives: list[str] = []
+    for cluster_id, group in plot_df.groupby("cluster_id"):
+        center_scaled = model.cluster_centers_[cluster_id]
+        group_indices = group.index.to_numpy()
+        distance = np.linalg.norm(scaled[group_indices] - center_scaled, axis=1)
+        representative_idx = group_indices[int(distance.argmin())]
+        representative = plot_df.loc[representative_idx, "city"]
+        representatives.append(representative)
+        plot_df.loc[group_indices, "cluster_representative"] = representative
+
+    pca = PCA(n_components=2, random_state=42)
+    components = pca.fit_transform(scaled)
+    plot_df["pca_1"] = components[:, 0]
+    plot_df["pca_2"] = components[:, 1]
+
+    fig, ax = plt.subplots(figsize=(9.7, 7.2))
     colors = plt.cm.Set2(np.linspace(0, 1, plot_df["cluster_id"].nunique()))
     for color, (name, group) in zip(colors, plot_df.groupby("cluster_name")):
         ax.scatter(
-            group["opportunity_score"],
-            group["rent_pressure"],
-            s=140 + group["ycsi"] * 4,
+            group["pca_1"],
+            group["pca_2"],
+            s=scale_bubble(group["ycsi"], 120, 620),
             color=color,
-            alpha=0.84,
+            alpha=0.86,
             edgecolor="white",
             linewidth=0.9,
             label=name,
         )
         for _, row in group.iterrows():
-            ax.text(row["opportunity_score"] + 0.012, row["rent_pressure"] + 0.012, row["city"], fontsize=8.5)
-    ax.set_xlabel("机会指数")
-    ax.set_ylabel("居住压力指数（越高压力越大）")
-    ax.set_title("K-Means 城市分类：机会与压力视角")
-    ax.set_xlim(-0.04, 1.04)
-    ax.set_ylim(-0.04, 1.04)
-    ax.grid(alpha=0.22)
+            marker = "★" if row["city"] == row["cluster_representative"] else ""
+            ax.text(row["pca_1"] + 0.04, row["pca_2"] + 0.04, f"{row['city']}{marker}", fontsize=8.5)
+
+    ax.axhline(0, color="#d0d4da", linewidth=0.8)
+    ax.axvline(0, color="#d0d4da", linewidth=0.8)
+    ax.set_xlabel(f"PCA 1（解释 {pca.explained_variance_ratio_[0] * 100:.1f}%）")
+    ax.set_ylabel(f"PCA 2（解释 {pca.explained_variance_ratio_[1] * 100:.1f}%）")
+    ax.set_title(f"五维 K-Means 城市聚类 PCA 图（K={best_k}，轮廓系数={best_score:.2f}）")
+    ax.grid(alpha=0.22, color=COLORS["grid"])
     ax.legend(title="聚类类型", frameon=False, loc="best")
     figure_path = save_figure("08_city_clusters.png")
 
     summary = (
-        plot_df.groupby("cluster_name")
+        plot_df.groupby(["cluster_id", "cluster_name"])
         .agg(
+            representative_city=("cluster_representative", "first"),
             city_list=("city", lambda values: "、".join(map(str, values))),
-            avg_ycsi=("ycsi", "mean"),
             city_count=("city", "count"),
+            avg_ycsi=("ycsi", "mean"),
+            opportunity_score=("opportunity_score", "mean"),
+            housing_friendliness=("housing_friendliness", "mean"),
+            commute_friendliness=("commute_friendliness", "mean"),
+            life_score=("life_score", "mean"),
+            growth_score=("growth_score", "mean"),
         )
-        .round(2)
+        .round(3)
         .reset_index()
     )
-    return figure_path, summary
+    summary["selected_k"] = best_k
+    summary["silhouette_score"] = round(float(best_score), 3)
+
+    return figure_path, summary, plot_df, representatives
 
 
-def plot_rent_trend(metrics: pd.DataFrame) -> Path | None:
-    """商品房租金 2018-2025 月度趋势（真实时间序列，补足时间维度）。"""
+def plot_city_radar(metrics: pd.DataFrame, representatives: list[str]) -> Path:
+    labels = list(DIMENSION_COLS.keys())
+    columns = list(DIMENSION_COLS.values())
+    selected = list(dict.fromkeys(representatives))
+    for city in metrics.sort_values("ycsi", ascending=False)["city"]:
+        if len(selected) >= 5:
+            break
+        if city not in selected:
+            selected.append(city)
+
+    angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
+    angles += angles[:1]
+    fig, ax = plt.subplots(figsize=(8.3, 8.3), subplot_kw={"polar": True})
+    color_map = plt.cm.Set2(np.linspace(0, 1, len(selected)))
+    for color, city in zip(color_map, selected):
+        values = metrics.loc[metrics["city"] == city, columns].iloc[0].tolist()
+        values += values[:1]
+        ax.plot(angles, values, linewidth=2, label=city, color=color)
+        ax.fill(angles, values, alpha=0.05, color=color)
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(labels, fontsize=11)
+    ax.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
+    ax.set_ylim(0, 1)
+    ax.set_title("聚类代表城市 YCSI 五维雷达图", y=1.08)
+    ax.legend(loc="upper right", bbox_to_anchor=(1.24, 1.08), frameon=False)
+    return save_figure("05_city_radar.png")
+
+
+def plot_rent_trend(metrics: pd.DataFrame, representative_cities: list[str]) -> Path | None:
     panel_path = CLEAN_DIR / "rent_panel.csv"
     if not panel_path.exists():
         return None
@@ -705,22 +1080,52 @@ def plot_rent_trend(metrics: pd.DataFrame) -> Path | None:
     panel["date"] = pd.to_datetime(panel["date"], errors="coerce")
     panel["rent_per_sqm"] = pd.to_numeric(panel["rent_per_sqm"], errors="coerce")
     panel = panel.dropna(subset=["date", "rent_per_sqm"])
+    panel = panel[panel["city"].isin(metrics["city"])]
 
-    # 高亮 YCSI 前 6 城，其余城市淡灰背景
-    top_cities = metrics.sort_values("ycsi", ascending=False)["city"].head(6).tolist()
-    fig, ax = plt.subplots(figsize=(11, 6.5))
+    base = (
+        panel[panel["date"].dt.year == 2018]
+        .groupby("city")["rent_per_sqm"]
+        .mean()
+        .rename("rent_2018")
+    )
+    if base.empty:
+        base = panel.groupby("city")["rent_per_sqm"].first().rename("rent_2018")
+    panel = panel.merge(base, on="city", how="left")
+    panel["rent_index_2018_100"] = panel["rent_per_sqm"] / panel["rent_2018"] * 100
+
+    highlight = list(dict.fromkeys(representative_cities))
+    if not highlight:
+        highlight = metrics.sort_values("ycsi", ascending=False)["city"].head(5).tolist()
+    colors = plt.cm.Set2(np.linspace(0, 1, len(highlight)))
+    color_by_city = dict(zip(highlight, colors))
+
+    fig, axes = plt.subplots(2, 1, figsize=(11, 9), sharex=True)
     for city, grp in panel.groupby("city"):
         grp = grp.sort_values("date")
-        if city in top_cities:
-            ax.plot(grp["date"], grp["rent_per_sqm"], linewidth=2, label=city, zorder=3)
+        if city in color_by_city:
+            axes[0].plot(grp["date"], grp["rent_per_sqm"], linewidth=2.1, label=city, color=color_by_city[city], zorder=3)
+            axes[1].plot(grp["date"], grp["rent_index_2018_100"], linewidth=2.1, label=city, color=color_by_city[city], zorder=3)
         else:
-            ax.plot(grp["date"], grp["rent_per_sqm"], linewidth=0.8,
-                    color="#cccccc", alpha=0.6, zorder=1)
-    ax.set_xlabel("时间")
-    ax.set_ylabel("商品房平均出租价格（元/㎡·月）")
-    ax.set_title("15 城商品房租金月度趋势（2018-2025，高亮 YCSI 前 6）")
-    ax.grid(alpha=0.22)
-    ax.legend(title="YCSI 前 6 城", frameon=False, loc="upper left", ncol=2)
+            axes[0].plot(grp["date"], grp["rent_per_sqm"], linewidth=0.8, color=COLORS["muted"], alpha=0.55, zorder=1)
+            axes[1].plot(grp["date"], grp["rent_index_2018_100"], linewidth=0.8, color=COLORS["muted"], alpha=0.55, zorder=1)
+
+    axes[0].set_ylabel("元/㎡·月")
+    axes[0].set_title("15 城商品房租金绝对水平")
+    axes[1].axhline(100, color="#555555", linestyle="--", linewidth=0.9)
+    axes[1].set_ylabel("租金指数（2018=100）")
+    axes[1].set_title("15 城商品房租金指数趋势")
+    axes[1].set_xlabel("时间")
+    for ax in axes:
+        ax.grid(alpha=0.22, color=COLORS["grid"])
+    axes[0].legend(title="聚类代表城市", frameon=False, loc="upper left", ncol=3)
+    axes[1].text(
+        0,
+        -0.25,
+        "指数计算：RentIndex_it = Rent_it / Rent_i,2018 × 100；曲线为原始月度数据，未使用移动平均。",
+        transform=axes[1].transAxes,
+        fontsize=8.8,
+        color="#5a6470",
+    )
     return save_figure("09_rent_trend.png")
 
 
@@ -729,15 +1134,29 @@ def export_scores(metrics: pd.DataFrame) -> Path:
         "city",
         "rank",
         "ycsi",
+        "ycsi_raw",
         "avg_salary",
         "avg_rent",
         "rent_income_ratio",
         "job_count",
+        "population_wan",
+        "job_per_10k",
+        "poi_per_10k",
+        "university_per_10k",
+        "subway_per_10k",
+        "metro_line_per_10k",
+        "gdp_per_capita",
+        "tertiary_industry_pct",
         "opportunity_score",
-        "rent_pressure",
+        "housing_friendliness",
+        "commute_friendliness",
         "life_score",
         "growth_score",
-        "commute_score",
+        "opportunity_score_contribution",
+        "housing_friendliness_contribution",
+        "commute_friendliness_contribution",
+        "life_score_contribution",
+        "growth_score_contribution",
     ]
     score_df = metrics.sort_values("rank")[columns].reset_index(drop=True)
     path = OUTPUT_DIR / "ycsi_city_scores.csv"
@@ -751,39 +1170,91 @@ def export_cluster_summary(summary: pd.DataFrame) -> Path:
     return path
 
 
+def validate_outputs(metrics: pd.DataFrame, generated: list[Path]) -> list[str]:
+    issues: list[str] = []
+    if metrics["city"].nunique() != 15:
+        issues.append(f"城市数量异常：{metrics['city'].nunique()}，预期15。")
+    expected_ranks = set(range(1, len(metrics) + 1))
+    if set(metrics["rank"]) != expected_ranks:
+        issues.append("排名不是连续的1-15。")
+    if not metrics["ycsi"].between(0, 100).all():
+        issues.append("YCSI 不在0-100范围内。")
+    for col in list(DIMENSION_COLS.values()) + [
+        "job_per_10k",
+        "poi_per_10k",
+        "university_per_10k",
+        "subway_per_10k",
+        "gdp_per_capita",
+    ]:
+        values = pd.to_numeric(metrics[col], errors="coerce")
+        if values.isna().any() or np.isinf(values).any():
+            issues.append(f"{col} 存在缺失或无穷值。")
+    for path in generated:
+        if not path.exists() or path.stat().st_size == 0:
+            issues.append(f"输出文件为空或缺失：{path}")
+    return issues
+
+
 def run() -> None:
     plan_path = write_chart_plan()
     metrics = load_base_data()
     metrics, source_notes = add_job_and_rent_metrics(metrics)
-    metrics, poi_scaled = calculate_ycsi(metrics)
+    metrics = calculate_ycsi(metrics)
+
+    cluster_path, cluster_summary, clustered_metrics, representatives = plot_city_clusters(metrics)
+    metrics = metrics.merge(
+        clustered_metrics[["city", "cluster_id", "cluster_name", "cluster_representative", "pca_1", "pca_2"]],
+        on="city",
+        how="left",
+    )
+
+    poi_paths = [
+        plot_life_score_dot(metrics),
+        plot_poi_composition_100pct(metrics),
+    ]
+    correlation_paths = plot_correlation_heatmaps(metrics)
+    compat_paths = [
+        copy_compat_output("06b_poi_composition_100pct.png", "06_poi_convenience_stack.png"),
+        copy_compat_output("07a_raw_variable_correlation_heatmap.png", "07_metric_correlation_heatmap.png"),
+    ]
 
     generated = [
         plan_path,
         export_scores(metrics),
         plot_ycsi_ranking(metrics),
-        plot_city_heat_points(metrics),
+        plot_city_spatial_distribution(metrics),
         plot_salary_rent_bubble(metrics),
-        plot_opportunity_pressure_quadrant(metrics),
-        plot_city_radar(metrics),
-        plot_poi_stack(metrics, poi_scaled),
-        plot_correlation_heatmap(metrics),
+        plot_opportunity_housing_quadrant(metrics),
+        plot_city_radar(metrics, representatives),
+        *poi_paths,
+        *correlation_paths,
+        *compat_paths,
+        cluster_path,
+        export_cluster_summary(cluster_summary),
     ]
-    cluster_path, cluster_summary = plot_city_clusters(metrics)
-    generated.append(cluster_path)
-    generated.append(export_cluster_summary(cluster_summary))
 
-    trend_path = plot_rent_trend(metrics)
+    trend_path = plot_rent_trend(metrics, representatives)
     if trend_path is not None:
         generated.append(trend_path)
+
+    validation_issues = validate_outputs(metrics, generated)
 
     print("数据来源说明：")
     for note in source_notes:
         print(f"- {note}")
     print("\nYCSI Top 5：")
     print(metrics.sort_values("rank")[["rank", "city", "ycsi"]].head(5).to_string(index=False))
+    print("\n聚类代表城市：")
+    print("、".join(representatives))
     print("\n已生成文件：")
     for path in generated:
         print(f"- {path}")
+    if validation_issues:
+        print("\n校验提示：")
+        for issue in validation_issues:
+            print(f"- {issue}")
+    else:
+        print("\n校验通过：15城齐全，排名连续，YCSI在0-100内，关键派生指标和输出文件有效。")
 
 
 if __name__ == "__main__":
