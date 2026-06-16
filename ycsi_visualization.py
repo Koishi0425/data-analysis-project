@@ -231,6 +231,11 @@ def minmax(series: pd.Series) -> pd.Series:
     return (values - values.min()) / span
 
 
+def score_minmax(series: pd.Series, floor: float = 0.05) -> pd.Series:
+    """Min-Max for scoring: maps the sample range to [floor, 1]."""
+    return floor + minmax(series) * (1 - floor)
+
+
 def scale_bubble(series: pd.Series, min_size: float = 90, max_size: float = 850) -> pd.Series:
     return min_size + minmax(series) * (max_size - min_size)
 
@@ -413,27 +418,27 @@ def calculate_ycsi(metrics: pd.DataFrame) -> pd.DataFrame:
     metrics["subway_per_10k"] = metrics["subway_per_10k"].fillna(0)
 
     metrics["opportunity_score"] = (
-        0.45 * minmax(metrics["avg_salary"])
-        + 0.40 * minmax(metrics["job_per_10k"])
-        + 0.15 * minmax(metrics["tertiary_industry_pct"])
+        0.45 * score_minmax(metrics["avg_salary"])
+        + 0.40 * score_minmax(metrics["job_per_10k"])
+        + 0.15 * score_minmax(metrics["tertiary_industry_pct"])
     )
-    metrics["housing_friendliness"] = 1 - minmax(metrics["rent_income_ratio"])
+    metrics["housing_friendliness"] = score_minmax(1 - minmax(metrics["rent_income_ratio"]))
 
     commute_access = (
-        0.70 * minmax(metrics["subway_per_10k"])
-        + 0.30 * minmax(metrics["metro_line_per_10k"])
+        0.70 * score_minmax(metrics["subway_per_10k"])
+        + 0.30 * score_minmax(metrics["metro_line_per_10k"])
     )
-    metrics["commute_friendliness"] = minmax(commute_access)
+    metrics["commute_friendliness"] = score_minmax(commute_access)
 
     poi_rate_cols = [f"{col}_per_10k" for col in POI_COLS]
-    poi_scaled = metrics[poi_rate_cols].apply(minmax)
-    metrics["life_score"] = minmax((poi_scaled * POI_WEIGHTS).sum(axis=1))
+    poi_scaled = metrics[poi_rate_cols].apply(score_minmax)
+    metrics["life_score"] = score_minmax((poi_scaled * POI_WEIGHTS).sum(axis=1))
 
     metrics["growth_score"] = (
-        0.35 * minmax(metrics["gdp_per_capita"])
-        + 0.30 * minmax(metrics["disposable_income"])
-        + 0.20 * minmax(metrics["university_per_10k"])
-        + 0.15 * minmax(metrics["tertiary_industry_pct"])
+        0.35 * score_minmax(metrics["gdp_per_capita"])
+        + 0.30 * score_minmax(metrics["disposable_income"])
+        + 0.20 * score_minmax(metrics["university_per_10k"])
+        + 0.15 * score_minmax(metrics["tertiary_industry_pct"])
     )
 
     for col, weight in DIMENSION_WEIGHTS.items():
@@ -492,7 +497,7 @@ def plot_ycsi_ranking(metrics: pd.DataFrame) -> Path:
         )
 
     ax.set_xlim(0, max(100, plot_df["ycsi"].max() + 8))
-    ax.set_xlabel("YCSI 综合得分（0-100，五维加权贡献）")
+    ax.set_xlabel("YCSI 综合得分（5-100，五维加权贡献）")
     ax.set_title("15 城青年城市生存力指数排名与五维贡献")
     ax.grid(axis="x", alpha=0.22, color=COLORS["grid"])
     ax.spines[["top", "right", "left"]].set_visible(False)
@@ -1177,8 +1182,8 @@ def validate_outputs(metrics: pd.DataFrame, generated: list[Path]) -> list[str]:
     expected_ranks = set(range(1, len(metrics) + 1))
     if set(metrics["rank"]) != expected_ranks:
         issues.append("排名不是连续的1-15。")
-    if not metrics["ycsi"].between(0, 100).all():
-        issues.append("YCSI 不在0-100范围内。")
+    if not metrics["ycsi"].between(5, 100).all():
+        issues.append("YCSI 不在5-100范围内。")
     for col in list(DIMENSION_COLS.values()) + [
         "job_per_10k",
         "poi_per_10k",
@@ -1254,7 +1259,7 @@ def run() -> None:
         for issue in validation_issues:
             print(f"- {issue}")
     else:
-        print("\n校验通过：15城齐全，排名连续，YCSI在0-100内，关键派生指标和输出文件有效。")
+        print("\n校验通过：15城齐全，排名连续，YCSI在5-100内，关键派生指标和输出文件有效。")
 
 
 if __name__ == "__main__":
